@@ -1,0 +1,14 @@
+{
+  "name": "pi-cmux-spawn",
+  "version": "0.1.0",
+  "description": "Spawn a new pi agent in a cmux terminal surface and bridge it to the caller via pi-intercom. Agents can create new collaborating agents without knowing they are cmux surfaces.",
+  "keywords": ["pi-package", "cmux", "pi", "intercom", "agent", "spawn"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
