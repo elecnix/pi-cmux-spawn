@@ -144,7 +144,18 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // 2. Create the new surface.
+      // 2. Capture existing intercom session ids so we can diff after launch
+      //    (avoids matching stale ghost registrations from the agent-identity
+      //    daemon that share the new agent's randomly-generated name).
+      let beforeIds = new Set<string>();
+      try {
+        const before = await scanIntercomSessions(3000);
+        beforeIds = new Set(before.map((s) => s.id));
+      } catch {
+        // Non-fatal; fall back to name-only matching below.
+      }
+
+      // 3. Create the new surface.
       const surfaceRef = createSurface(paneRef, cwd);
       if (!surfaceRef) {
         return {
@@ -153,10 +164,10 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // 3. Launch a bare pi in it (gets an auto agent name + registers with intercom).
+      // 4. Launch a bare pi in it (gets an auto agent name + registers with intercom).
       launchPi(surfaceRef, cwd);
 
-      // 4. Read the new agent's name from the surface title.
+      // 5. Read the new agent's name from the surface title.
       const agentName = await readAgentName(surfaceRef);
       if (!agentName) {
         return {
@@ -167,29 +178,34 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // 5. Best-effort: look up the intercom session id by name + cwd.
+      // 6. Best-effort: look up the intercom session id by name + cwd,
+      //    excluding ids that existed before launch (ghost dedup).
       let sessionId: string | undefined;
       try {
         const sessions = await scanIntercomSessions(4000);
-        const peer = findPeerByName(sessions, agentName, process.pid, cwd);
+        const peer = findPeerByName(sessions, agentName, process.pid, cwd, beforeIds);
         if (peer) sessionId = peer.id;
       } catch {
         // Non-fatal: the name is enough for intercom send.
       }
 
-      // 6. Build the intercom instructions for the caller.
+      // 7. Build the intercom instructions for the caller.
+      //    Prefer the session id as the `to` target: the agent-identity daemon
+      //    keeps ghost registrations for offline agents, so a name can be
+      //    ambiguous ("Multiple sessions named X are connected"). The id is
+      //    unambiguous. Fall back to the name only if we couldn't resolve an id.
       const task = params.task?.trim();
       const messageArg = task
         ? task.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
         : "<your message here>";
-      const intercomCall = `intercom({ action: "send", to: "${agentName}", message: "${messageArg}" })`;
+      const target = sessionId ?? agentName;
+      const intercomCall = `intercom({ action: "send", to: "${target}", message: "${messageArg}" })`;
 
       const lines: string[] = [
         `✅ Spawned a new agent.`,
         ``,
         `- **Agent name:** ${agentName}`,
-        ...(sessionId ? [`- **Intercom session id:** ${sessionId}`] : []),
-        ...(sessionId ? [] : [`- **Intercom session id:** (not yet available — the name above is enough for \`intercom send\`)`]),
+        ...(sessionId ? [`- **Intercom session id:** ${sessionId}`] : [`- **Intercom session id:** (not resolved — target by name below; if \`intercom send\` reports "Multiple sessions named", run \`intercom list\` and use the session id)`]),
         `- **Surface:** ${surfaceRef}`,
         `- **Working directory:** ${cwd}`,
         ``,
@@ -201,6 +217,7 @@ export default function (pi: ExtensionAPI) {
         intercomCall,
         "```",
         ``,
+        ...(sessionId ? [`Use the **session id** above as the \`to\` target (not the name) — it's unambiguous even when offline-agent ghosts share the name.`] : []),
         ...(task
           ? [`The task above is pre-filled from your \`task\` parameter. Send it now, then stop. The new agent will do the work and reply over intercom.`]
           : [`Replace \`<your message here>\` with the task you want it to do. The new agent is idle and ready.`]),
@@ -218,13 +235,18 @@ export default function (pi: ExtensionAPI) {
   // Convenience slash command for humans.
   pi.registerCommand("spawn-agent", {
     description: "Spawn a new pi agent in a cmux tab and print its intercom address",
-    handler: async (args, ctx) => {
+    handler: async (_args, ctx) => {
       const cwd = ctx.cwd;
       const paneRef = identifyCallerPane();
       if (!paneRef) {
         ctx.ui.notify("Not inside a cmux pane", "error");
         return;
       }
+      let beforeIds = new Set<string>();
+      try {
+        const before = await scanIntercomSessions(3000);
+        beforeIds = new Set(before.map((s) => s.id));
+      } catch {}
       const surfaceRef = createSurface(paneRef, cwd);
       if (!surfaceRef) {
         ctx.ui.notify("Failed to create cmux surface", "error");
@@ -240,7 +262,7 @@ export default function (pi: ExtensionAPI) {
       let sessionId: string | undefined;
       try {
         const sessions = await scanIntercomSessions(4000);
-        const peer = findPeerByName(sessions, agentName, process.pid, cwd);
+        const peer = findPeerByName(sessions, agentName, process.pid, cwd, beforeIds);
         if (peer) sessionId = peer.id;
       } catch {}
       ctx.ui.notify(

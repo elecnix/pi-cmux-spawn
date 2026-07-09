@@ -154,20 +154,34 @@ export function scanIntercomSessions(timeoutMs = 4000): Promise<ScannedSession[]
 }
 
 /**
- * Find a peer session by agent name (and optionally cwd), excluding the
- * caller's own pid. Returns the matching session, or undefined.
+ * Find the freshly-launched peer session by agent name.
+ *
+ * `excludeIds` is the set of intercom session ids observed BEFORE the launch
+ * (a before/after diff). This is what reliably distinguishes the new agent
+ * from ghost registrations that the pi-agent-identity daemon keeps for
+ * offline agents — ghosts can share the new agent's randomly-generated name
+ * and cwd but will already have been present in the pre-launch scan.
+ *
+ * Matching priority:
+ *   1. name + cwd + id not in excludeIds + pid != excludePid   (the new agent)
+ *   2. name + id not in excludeIds + pid != excludePid          (cwd mismatch)
+ *   3. name + pid != excludePid                                 (fallback)
  */
 export function findPeerByName(
   sessions: ScannedSession[],
   name: string,
   excludePid?: number,
   cwd?: string,
+  excludeIds?: Set<string>,
 ): ScannedSession | undefined {
   const target = name.toLowerCase();
-  return sessions.find(
-    (s) =>
-      s.name?.toLowerCase() === target &&
-      s.pid !== excludePid &&
-      (cwd === undefined || s.cwd === cwd),
+  const notExcluded = (s: ScannedSession) =>
+    s.pid !== excludePid && (excludeIds === undefined || !excludeIds.has(s.id));
+  const byName = (s: ScannedSession) => s.name?.toLowerCase() === target;
+
+  return (
+    sessions.find((s) => byName(s) && (cwd === undefined || s.cwd === cwd) && notExcluded(s)) ??
+    sessions.find((s) => byName(s) && notExcluded(s)) ??
+    sessions.find((s) => byName(s) && s.pid !== excludePid)
   );
 }
