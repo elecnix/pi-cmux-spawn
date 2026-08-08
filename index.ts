@@ -121,18 +121,38 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       task: Type.Optional(Type.String({
         description:
-          "Optional initial task/prompt for the new agent. When provided, the result includes a " +
-          "ready-to-send intercom call pre-filled with this task. The calling agent sends it (so the " +
-          "new agent sees the real caller as the sender).",
+          "Optional initial task/prompt for the new agent. If provided together with auto_send=true, " +
+          "the tool queues a follow-up user message so your next turn auto-sends it — the new agent " +
+          "sees you (the real caller) as the sender. Without auto_send, the result includes a " +
+          "ready-to-send intercom call pre-filled with this task.",
       })),
       cwd: Type.Optional(Type.String({
         description:
           "Working directory for the new agent. Defaults to the current working directory.",
       })),
+      wait_for_ready: Type.Optional(Type.Boolean({
+        description:
+          "Wait for the new agent to boot and register with intercom before returning (up to 30s). " +
+          "Default true. Set to false to return immediately after launch — get back only the surface " +
+          "ref and cwd; the agent will be reachable by name/id within a few seconds.",
+        default: true,
+      })),
+      auto_send: Type.Optional(Type.Boolean({
+        description:
+          "When true and task is provided, queues a follow-up user message so you automatically send " +
+          "the task via intercom in your next turn (preserving your identity as the sender). Default " +
+          "false. Requires wait_for_ready to also be true (enforced).",
+        default: false,
+      })),
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const cwd = params.cwd?.trim() || ctx.cwd;
+      const waitForReady = params.wait_for_ready !== false; // defaults true
+      const autoSend = params.auto_send === true;
+      const task = params.task?.trim();
+
+      // ── Shared preamble: cmux + surface + launch ───────────────────
 
       // 1. cmux must be available and we must be running inside a cmux pane.
       const paneRef = identifyCallerPane();
@@ -145,15 +165,11 @@ export default function (pi: ExtensionAPI) {
       }
 
       // 2. Capture existing intercom session ids so we can diff after launch
-      //    (avoids matching stale ghost registrations from the agent-identity
-      //    daemon that share the new agent's randomly-generated name).
       let beforeIds = new Set<string>();
       try {
         const before = await scanIntercomSessions(3000);
         beforeIds = new Set(before.map((s) => s.id));
-      } catch {
-        // Non-fatal; fall back to name-only matching below.
-      }
+      } catch { /* fall back to name-only matching */ }
 
       // 3. Create the new surface.
       const surfaceRef = createSurface(paneRef, cwd);
@@ -164,8 +180,21 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // 4. Launch a bare pi in it (gets an auto agent name + registers with intercom).
+      // 4. Launch a bare pi in it.
       launchPi(surfaceRef, cwd);
+
+      // ── Fast path: don't wait ──────────────────────────────────────
+
+      if (!waitForReady) {
+        const hint = `The new agent is booting. When it is ready (a few seconds), find it with \`intercom list\` (look for a new session whose cwd is \`${cwd}\`). Target it by session id, not name, to avoid ghost- duplicate issues.`;
+        return {
+          content: [{ type: "text", text:
+            `✅ Launched a new pi agent in ${surfaceRef} (\`${cwd}\`).\n\n${hint}` }],
+          details: { surfaceRef, cwd, waitForReady: false },
+        };
+      }
+
+      // ── Wait for readiness: name + session id ──────────────────────
 
       // 5. Read the new agent's name from the surface title.
       const agentName = await readAgentName(surfaceRef);
@@ -185,16 +214,40 @@ export default function (pi: ExtensionAPI) {
         const sessions = await scanIntercomSessions(4000);
         const peer = findPeerByName(sessions, agentName, process.pid, cwd, beforeIds);
         if (peer) sessionId = peer.id;
-      } catch {
-        // Non-fatal: the name is enough for intercom send.
+      } catch { /* non-fatal */ }
+
+      // ── Auto-send the task as a follow-up ──────────────────────────
+
+      if (autoSend && task) {
+        const target = sessionId ?? agentName;
+        const escapedTask = task.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+        const sendCmd = `intercom({ action: "send", to: "${target}", message: "${escapedTask}" })`;
+
+        pi.sendUserMessage(
+          [
+            `You just spawned **${agentName}** via spawn_agent. Now send it the task over intercom (fire-and-forget), then end your turn — its reply arrives later as a 📨 intercom notification.`,
+            "",
+            "```",
+            sendCmd,
+            "```",
+          ].join("\n"),
+          { deliverAs: "followUp" },
+        );
+
+        const idInfo = sessionId
+          ? `session \`${sessionId.slice(0, 12)}…\``
+          : `name \`${agentName}\``;
+        return {
+          content: [{ type: "text", text:
+            `✅ Spawned **${agentName}** in ${surfaceRef} (\`${cwd}\`). ` +
+            `Auto-sent the task via follow-up — your next turn will deliver it to ${idInfo} over intercom. ` +
+            `Send and stop; the reply arrives as a 📨 notification.` }],
+          details: { agentName, sessionId, surfaceRef, cwd, autoSend: true },
+        };
       }
 
-      // 7. Build the intercom instructions for the caller.
-      //    Prefer the session id as the `to` target: the agent-identity daemon
-      //    keeps ghost registrations for offline agents, so a name can be
-      //    ambiguous ("Multiple sessions named X are connected"). The id is
-      //    unambiguous. Fall back to the name only if we couldn't resolve an id.
-      const task = params.task?.trim();
+      // ── Manual-send path: return instructions ──────────────────────
+
       const messageArg = task
         ? task.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
         : "<your message here>";
