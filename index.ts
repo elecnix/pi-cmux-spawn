@@ -23,7 +23,62 @@
 import { spawnSync } from "node:child_process";
 import { Type, type Static } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { randomUUID } from "node:crypto";
 import { scanIntercomSessions, findPeerByName } from "./broker-scan.ts";
+
+// General "send as the current session" event contract, provided by pi-intercom.
+// Duplicated here as loose-coupled string constants (the way pi-subagents does
+// for its own intercom events) so this extension has no hard import dependency
+// on pi-intercom. pi-intercom listens for INTERCOM_EXTENSION_SEND_EVENT and
+// forwards the message through the CURRENT session's own intercom client, so
+// the broker records the message's `from` as THIS session — sender identity is
+// preserved and replies route back natively. A matching result event carries
+// { delivered, reason } so delivery can be confirmed, not assumed.
+const INTERCOM_EXTENSION_SEND_EVENT = "intercom:extension-send";
+const INTERCOM_EXTENSION_SEND_RESULT_EVENT = "intercom:extension-send-result";
+
+/**
+ * Deliver `text` to `toSessionId` over intercom AS the current session, by
+ * emitting the pi-intercom "send as current session" event. Resolves with the
+ * broker's delivery outcome. Never rejects — failures are reported, not
+ * thrown, so the caller can surface them honestly.
+ */
+async function sendTaskAsCurrentSession(
+  pi: ExtensionAPI,
+  toSessionId: string,
+  text: string,
+  timeoutMs = 10_000,
+): Promise<{ delivered: boolean; reason?: string }> {
+  return new Promise((resolve) => {
+    const requestId = randomUUID();
+    let settled = false;
+    const finish = (result: { delivered: boolean; reason?: string }) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      off();
+      resolve(result);
+    };
+    const off = pi.events.on(INTERCOM_EXTENSION_SEND_RESULT_EVENT, (data) => {
+      if (!data || typeof data !== "object") return;
+      const r = data as { requestId?: unknown; delivered?: unknown; reason?: unknown };
+      if (r.requestId !== requestId) return;
+      finish({
+        delivered: r.delivered === true,
+        reason: typeof r.reason === "string" ? r.reason : undefined,
+      });
+    });
+    const timer = setTimeout(
+      () => finish({ delivered: false, reason: "send timeout (pi-intercom may not be installed or reachable)" }),
+      timeoutMs,
+    );
+    try {
+      pi.events.emit(INTERCOM_EXTENSION_SEND_EVENT, { to: toSessionId, message: text, requestId });
+    } catch (e) {
+      finish({ delivered: false, reason: `failed to emit send event: ${String((e as Error).message ?? e)}` });
+    }
+  });
+}
 
 const AGENT_NAME_RE = /[a-z]+-[a-z]+-[0-9]+/;
 const SURFACE_RE = /surface:[0-9]+/;
@@ -110,20 +165,21 @@ export default function (pi: ExtensionAPI) {
     label: "Spawn Agent",
     description:
       "Create a new collaborating pi agent in a new terminal surface and bridge it via pi-intercom. " +
-      "Returns the new agent's name (and intercom session id when available) plus the exact intercom " +
-      "command to send it a message. The new agent boots idle and ready; send it a task over intercom " +
-      "(fire-and-forget), then end your turn — its reply arrives later as a 📨 intercom notification.",
+      "Returns the new agent's name (and intercom session id when available). With auto_send=true the " +
+      "extension delivers the task to the new agent over intercom itself and reports whether delivery " +
+      "succeeded — you do not send it yourself. Without auto_send, the result includes a ready-to-send " +
+      "intercom call to use. The reply arrives later as a 📨 intercom notification.",
     promptSnippet:
       "Create a new collaborating agent that replies over pi-intercom. Use spawn_agent to delegate async work to a fresh agent.",
     promptGuidelines: [
-      "Use spawn_agent when the user asks to create, spawn, or delegate to a new agent that can collaborate over intercom. After calling it, send the task to the returned agent name via the intercom tool, then end your turn.",
+      "Use spawn_agent when the user asks to create, spawn, or delegate to a new agent that can collaborate over intercom. With auto_send=true the extension delivers the task directly and reports the outcome; otherwise send the task to the returned agent name via the intercom tool, then end your turn.",
     ],
     parameters: Type.Object({
       task: Type.Optional(Type.String({
         description:
           "Optional initial task/prompt for the new agent. If provided together with auto_send=true, " +
-          "the tool queues a follow-up user message so your next turn auto-sends it — the new agent " +
-          "sees you (the real caller) as the sender. Without auto_send, the result includes a " +
+          "the extension sends it directly to the new agent over intercom itself and reports whether " +
+          "delivery succeeded — you do not send it yourself. Without auto_send, the result includes a " +
           "ready-to-send intercom call pre-filled with this task.",
       })),
       cwd: Type.Optional(Type.String({
@@ -139,9 +195,11 @@ export default function (pi: ExtensionAPI) {
       })),
       auto_send: Type.Optional(Type.Boolean({
         description:
-          "When true and task is provided, queues a follow-up user message so you automatically send " +
-          "the task via intercom in your next turn (preserving your identity as the sender). Default " +
-          "false. Requires wait_for_ready to also be true (enforced).",
+          "When true and task is provided, the extension sends the task to the new agent over intercom " +
+          "as the CURRENT session itself (via the pi-intercom ‘send as current session’ event) and reports " +
+          "whether delivery succeeded; it does NOT queue a follow-up for you to send. The message's `from` " +
+          "is this session, so replies route back to you natively. One shot, no retry. Requires pi-intercom " +
+          "to be installed, and wait_for_ready to also be true (enforced). Default false.",
         default: false,
       })),
     }),
@@ -216,33 +274,57 @@ export default function (pi: ExtensionAPI) {
         if (peer) sessionId = peer.id;
       } catch { /* non-fatal */ }
 
-      // ── Auto-send the task as a follow-up ──────────────────────────
+      // ── Auto-send: deliver the task to the new agent directly ────────
+      //
+      // The extension sends the task over intercom itself — it does NOT queue a
+      // follow-up that asks the calling agent to do the send. One shot, no retry:
+      // the broker's `delivered` ack is the confirmation; a failed delivery (broker
+      // at capacity, peer not registered, timeout) is surfaced honestly so the
+      // caller can escalate instead of silently losing the task. See issue #2.
 
       if (autoSend && task) {
-        const target = sessionId ?? agentName;
+        // The new agent registers with intercom shortly after boot. If the first
+        // scan (step 6) missed it, poll a few times before giving up — direct
+        // send needs the peer's session id (sending by name is ambiguous: the
+        // broker rejects when multiple sessions share a name).
+        if (!sessionId) {
+          const pollDeadline = Date.now() + 6_000;
+          while (!sessionId && Date.now() < pollDeadline) {
+            await sleep(1_000);
+            try {
+              const sessions = await scanIntercomSessions(4000);
+              const peer = findPeerByName(sessions, agentName, process.pid, cwd, beforeIds);
+              if (peer) sessionId = peer.id;
+            } catch { /* keep polling */ }
+          }
+        }
+
+        if (!sessionId) {
+          const escapedTask = task.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+          const sendCmd = `intercom({ action: "send", to: "${agentName}", message: "${escapedTask}" })`;
+          return {
+            content: [{ type: "text", text:
+              `⚠️ Spawned **${agentName}** in ${surfaceRef} (\`${cwd}\`), but could not resolve its intercom session id in time, so the task was NOT delivered. The new agent is idle with no task. Retry shortly, or send the task yourself:\n\n\`\`\`\n${sendCmd}\n\`\`\`` }],
+            details: { agentName, sessionId, surfaceRef, cwd, autoSend: true, delivered: false, reason: "session id not resolved" },
+          };
+        }
+
+        const result = await sendTaskAsCurrentSession(pi, sessionId, task);
+
+        if (result.delivered) {
+          return {
+            content: [{ type: "text", text:
+              `✅ Spawned **${agentName}** in ${surfaceRef} (\`${cwd}\`) and delivered the task to it over intercom (session \`${sessionId.slice(0, 12)}…\`). The reply arrives later as a 📨 notification.` }],
+            details: { agentName, sessionId, surfaceRef, cwd, autoSend: true, delivered: true },
+          };
+        }
+
         const escapedTask = task.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-        const sendCmd = `intercom({ action: "send", to: "${target}", message: "${escapedTask}" })`;
-
-        pi.sendUserMessage(
-          [
-            `You just spawned **${agentName}** via spawn_agent. Now send it the task over intercom (fire-and-forget), then end your turn — its reply arrives later as a 📨 intercom notification.`,
-            "",
-            "```",
-            sendCmd,
-            "```",
-          ].join("\n"),
-          { deliverAs: "followUp" },
-        );
-
-        const idInfo = sessionId
-          ? `session \`${sessionId.slice(0, 12)}…\``
-          : `name \`${agentName}\``;
+        const sendCmd = `intercom({ action: "send", to: "${sessionId}", message: "${escapedTask}" })`;
         return {
           content: [{ type: "text", text:
-            `✅ Spawned **${agentName}** in ${surfaceRef} (\`${cwd}\`). ` +
-            `Auto-sent the task via follow-up — your next turn will deliver it to ${idInfo} over intercom. ` +
-            `Send and stop; the reply arrives as a 📨 notification.` }],
-          details: { agentName, sessionId, surfaceRef, cwd, autoSend: true },
+            `⚠️ Spawned **${agentName}** in ${surfaceRef} (\`${cwd}\`), but the task was NOT delivered over intercom: ${result.reason ?? "unknown reason"}. The new agent is idle with no task — do not assume it received the work. The broker may be at capacity (the send will keep failing until capacity frees), or the peer may not be registered yet. You can retry, or surface this failure. Retry command:\n\n\`\`\`\n${sendCmd}\n\`\`\`` }],
+          details: { agentName, sessionId, surfaceRef, cwd, autoSend: true, delivered: false, reason: result.reason },
         };
       }
 
