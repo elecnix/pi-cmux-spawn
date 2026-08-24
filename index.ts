@@ -26,28 +26,32 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import { scanIntercomSessions, findPeerByName } from "./broker-scan.ts";
 
-// General "send as the current session" event contract, provided by pi-intercom.
-// Duplicated here as loose-coupled string constants (the way pi-subagents does
-// for its own intercom events) so this extension has no hard import dependency
-// on pi-intercom. pi-intercom listens for INTERCOM_EXTENSION_SEND_EVENT and
-// forwards the message through the CURRENT session's own intercom client, so
-// the broker records the message's `from` as THIS session — sender identity is
-// preserved and replies route back natively. A matching result event carries
-// { delivered, reason } so delivery can be confirmed, not assumed.
-const INTERCOM_EXTENSION_SEND_EVENT = "intercom:extension-send";
-const INTERCOM_EXTENSION_SEND_RESULT_EVENT = "intercom:extension-send-result";
+// The pi-intercom Outbox is the consent-aware, policy-owning primitive for an
+// extension to request an outbound message delivered AS the current session,
+// while pi-intercom owns consent (confirmSend), target resolution, attribution,
+// audit, and the terminal result. A producer submits a request on the pi event
+// bus and waits for the matching terminal result. The constants are duplicated
+// here as loose-coupled strings (the way pi-subagents duplicates its intercom
+// event names) so this extension has no hard import dependency on pi-intercom;
+// the shape matches extension-api.ts in pi-intercom 0.12.0.
+const INTERCOM_OUTBOX_REQUEST_EVENT = "intercom:outbox-request";
+const INTERCOM_OUTBOX_RESULT_EVENT = "intercom:outbox-result";
+
+const OUTBOX_EXTENSION_ID = "pi-cmux-spawn";
+const OUTBOX_EXTENSION_NAME = "pi-cmux-spawn";
 
 /**
- * Deliver `text` to `toSessionId` over intercom AS the current session, by
- * emitting the pi-intercom "send as current session" event. Resolves with the
- * broker's delivery outcome. Never rejects — failures are reported, not
- * thrown, so the caller can surface them honestly.
+ * Request pi-intercom to deliver `text` to `toSessionId` AS the current
+ * session via the consent-aware Outbox, and wait for the terminal result.
+ * Resolves true on `sent`; false with a reason on `rejected`/`blocked`/`failed`.
+ * Never rejects — outcomes are returned, not thrown, so the caller can surface
+ * them honestly.
  */
-async function sendTaskAsCurrentSession(
+async function sendTaskViaOutbox(
   pi: ExtensionAPI,
   toSessionId: string,
   text: string,
-  timeoutMs = 10_000,
+  timeoutMs = 15_000,
 ): Promise<{ delivered: boolean; reason?: string }> {
   return new Promise((resolve) => {
     const requestId = randomUUID();
@@ -59,23 +63,33 @@ async function sendTaskAsCurrentSession(
       off();
       resolve(result);
     };
-    const off = pi.events.on(INTERCOM_EXTENSION_SEND_RESULT_EVENT, (data) => {
+    const off = pi.events.on(INTERCOM_OUTBOX_RESULT_EVENT, (data) => {
       if (!data || typeof data !== "object") return;
-      const r = data as { requestId?: unknown; delivered?: unknown; reason?: unknown };
+      const r = data as { requestId?: unknown; status?: unknown; code?: unknown; detail?: unknown };
       if (r.requestId !== requestId) return;
-      finish({
-        delivered: r.delivered === true,
-        reason: typeof r.reason === "string" ? r.reason : undefined,
-      });
+      if (r.status === "sent") {
+        finish({ delivered: true });
+        return;
+      }
+      const code = typeof r.code === "string" ? r.code : "delivery_failed";
+      const detail = typeof r.detail === "string" && r.detail.length > 0 ? r.detail : "";
+      finish({ delivered: false, reason: [code, detail].filter(Boolean).join(": ") || "outbox request was not sent" });
     });
     const timer = setTimeout(
-      () => finish({ delivered: false, reason: "send timeout (pi-intercom may not be installed or reachable)" }),
+      () => finish({ delivered: false, reason: "outbox timeout (pi-intercom may not be installed or reachable)" }),
       timeoutMs,
     );
     try {
-      pi.events.emit(INTERCOM_EXTENSION_SEND_EVENT, { to: toSessionId, message: text, requestId });
+      pi.events.emit(INTERCOM_OUTBOX_REQUEST_EVENT, {
+        version: 1,
+        requestId,
+        extensionId: OUTBOX_EXTENSION_ID,
+        extensionName: OUTBOX_EXTENSION_NAME,
+        to: toSessionId,
+        message: text,
+      });
     } catch (e) {
-      finish({ delivered: false, reason: `failed to emit send event: ${String((e as Error).message ?? e)}` });
+      finish({ delivered: false, reason: `failed to emit outbox request: ${String((e as Error).message ?? e)}` });
     }
   });
 }
@@ -166,8 +180,9 @@ export default function (pi: ExtensionAPI) {
     description:
       "Create a new collaborating pi agent in a new terminal surface and bridge it via pi-intercom. " +
       "Returns the new agent's name (and intercom session id when available). With auto_send=true the " +
-      "extension delivers the task to the new agent over intercom itself and reports whether delivery " +
-      "succeeded — you do not send it yourself. Without auto_send, the result includes a ready-to-send " +
+      "extension submits a consent-aware Outbox request to pi-intercom and delivers the task to the new " +
+      "agent as the current session, reporting whether delivery succeeded — you do not send it yourself. " +
+      "Without auto_send, the result includes a ready-to-send " +
       "intercom call to use. The reply arrives later as a 📨 intercom notification.",
     promptSnippet:
       "Create a new collaborating agent that replies over pi-intercom. Use spawn_agent to delegate async work to a fresh agent.",
@@ -195,11 +210,12 @@ export default function (pi: ExtensionAPI) {
       })),
       auto_send: Type.Optional(Type.Boolean({
         description:
-          "When true and task is provided, the extension sends the task to the new agent over intercom " +
-          "as the CURRENT session itself (via the pi-intercom ‘send as current session’ event) and reports " +
-          "whether delivery succeeded; it does NOT queue a follow-up for you to send. The message's `from` " +
-          "is this session, so replies route back to you natively. One shot, no retry. Requires pi-intercom " +
-          "to be installed, and wait_for_ready to also be true (enforced). Default false.",
+          "When true and task is provided, the extension submits a consent-aware Outbox request to " +
+          "pi-intercom and delivers the task to the new agent as the current session, reporting " +
+          "whether delivery succeeded; it does NOT queue a follow-up for you to send. The message's " +
+          "`from` is this session, so replies route back to you natively. One shot, no retry. Requires " +
+          "pi-intercom (with Outbox support) to be installed, and wait_for_ready to also be true " +
+          "(enforced). Default false.",
         default: false,
       })),
     }),
@@ -309,7 +325,7 @@ export default function (pi: ExtensionAPI) {
           };
         }
 
-        const result = await sendTaskAsCurrentSession(pi, sessionId, task);
+        const result = await sendTaskViaOutbox(pi, sessionId, task);
 
         if (result.delivered) {
           return {
